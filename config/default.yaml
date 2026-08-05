@@ -1,0 +1,194 @@
+# ---------------------------------------------------------------------------
+# Orphus default configuration
+#
+# Precedence, lowest to highest:
+#   1. these defaults
+#   2. config/<environment>.yaml            (ORPHUS_ENV, e.g. "production")
+#   3. config/local.yaml                    (gitignored, developer overrides)
+#   4. .env file
+#   5. process environment variables
+#   6. runtime overrides passed to load_settings()
+#
+# Nested keys map to env vars with a double underscore and the ORPHUS_ prefix:
+#   asr.att_context_size  ->  ORPHUS_ASR__ATT_CONTEXT_SIZE
+# The flat aliases named in the deployment spec (HOST, PORT, REDIS_URL,
+# GROK_API_KEY, ...) are also honoured; see config/settings.py.
+# ---------------------------------------------------------------------------
+
+environment: development
+
+server:
+  host: 0.0.0.0
+  port: 8000
+  # Uvicorn workers. Keep at 1 when models are in-process: every extra worker
+  # would load its own copy of the weights and multiply VRAM use. Scale with
+  # the internal scheduler's worker pool instead.
+  api_workers: 1
+  request_timeout_s: 30.0
+  shutdown_grace_s: 20.0
+  cors_origins: []
+
+# --- Voice activity detection ----------------------------------------------
+vad:
+  enabled: true
+  # Silero runs on CPU by design: ~2MB ONNX at <1ms per 32ms frame. Putting it
+  # on the GPU would contend for kernel launches with vLLM's continuous
+  # batching, which is the real bottleneck at 20 sessions.
+  device: cpu
+  threshold: 0.5
+  # Speech must persist this long before SPEECH_STARTED fires. Suppresses
+  # coughs and keyboard clicks from triggering a barge-in.
+  min_speech_ms: 250
+  # Silence this long ends the utterance. 700ms is the usual conversational
+  # sweet spot: shorter clips people mid-thought, longer feels laggy.
+  min_silence_ms: 700
+  # Audio retained before SPEECH_STARTED so the ASR sees the whole first word.
+  speech_pad_ms: 120
+
+# --- Speech recognition -----------------------------------------------------
+asr:
+  model_id: nvidia/nemotron-3.5-asr-streaming-0.6b
+  device: cuda:0
+  dtype: bfloat16
+  # Cache-aware streaming latency/accuracy tradeoff. Supported settings:
+  #   [56, 0]  ->   80ms   lowest latency, lowest accuracy
+  #   [56, 1]  ->  160ms
+  #   [56, 3]  ->  320ms   <- default: best balance for conversational turns
+  #   [56, 6]  ->  560ms
+  #   [56, 13] -> 1120ms   highest accuracy, noticeably laggy in dialogue
+  att_context_size: [56, 3]
+  # null => let the multilingual model auto-detect.
+  language: null
+  # Utterances from different sessions are batched into one forward pass.
+  # 20 matches MAX_CONCURRENT_SESSIONS so a full house still fits in one batch.
+  max_batch_size: 20
+  # How long the batcher waits to fill a batch. Must stay well under the
+  # att_context_size latency or it becomes the dominant delay.
+  batch_timeout_ms: 12
+  strip_lang_tags: true
+
+# --- Speech synthesis -------------------------------------------------------
+tts:
+  model_id: canopylabs/orpheus-tts-0.1-finetune-prod
+  device: cuda:0
+  dtype: bfloat16
+  default_voice: tara
+  # Ordered by the upstream model card's conversational-realism ranking.
+  voices: [tara, leah, jess, leo, dan, mia, zac, zoe]
+  max_model_len: 2048
+  # Fraction of *total* VRAM vLLM may reserve. 0.45 of 48GB ~= 21.6GB, leaving
+  # room for the ASR model, the SNAC decoder, and fragmentation headroom.
+  gpu_memory_utilization: 0.45
+  temperature: 0.6
+  top_p: 0.9
+  # >= 1.1 is required for stable Orpheus generation; below it the model loops.
+  repetition_penalty: 1.15
+  # Synthesis starts once this many characters form a clause, rather than
+  # waiting for the full LLM response. Drives first-audio latency.
+  min_chunk_chars: 40
+  sentence_terminators: [".", "!", "?", ";", ":", "\n"]
+
+# --- LLM provider -----------------------------------------------------------
+llm:
+  provider: grok
+  model: grok-4-fast
+  base_url: https://api.x.ai/v1
+  max_tokens: 512
+  temperature: 0.7
+  timeout_s: 30.0
+  connect_timeout_s: 5.0
+  max_retries: 3
+  retry_backoff_s: 0.5
+  # Consecutive failures before the circuit opens and requests fail fast.
+  circuit_breaker_threshold: 5
+  circuit_breaker_reset_s: 30.0
+  system_prompt: >-
+    You are a helpful voice assistant. Your replies are spoken aloud, so keep
+    them concise and conversational. Prefer one or two short sentences. Never
+    use markdown, bullet points, code blocks, or emoji.
+
+# --- Sessions ---------------------------------------------------------------
+session:
+  max_concurrent: 20
+  idle_timeout_s: 300.0
+  max_duration_s: 3600.0
+  # Turns retained in the prompt. Older turns are summarised out.
+  history_max_turns: 20
+  history_max_chars: 8000
+  persist_transcripts: true
+
+# --- Scheduler and queues ---------------------------------------------------
+scheduler:
+  # Bounded everywhere. Unbounded queues are the classic way a real-time voice
+  # system dies: latency climbs until the process OOMs instead of shedding load.
+  audio_queue_size: 256
+  asr_queue_size: 128
+  llm_queue_size: 64
+  tts_queue_size: 128
+  # What to do when a queue is full: drop_oldest keeps the conversation live at
+  # the cost of a dropped frame, which is the right call for realtime audio.
+  overflow_policy: drop_oldest
+  worker_count: 4
+  admission_high_watermark: 0.85
+  drain_timeout_s: 15.0
+
+# --- Datastores -------------------------------------------------------------
+redis:
+  url: redis://localhost:6379/0
+  max_connections: 50
+  socket_timeout_s: 5.0
+  key_prefix: "orphus:"
+
+database:
+  url: postgresql+asyncpg://orphus:orphus@localhost:5432/orphus
+  pool_size: 10
+  max_overflow: 20
+  pool_timeout_s: 30.0
+  echo: false
+
+# --- Logging ----------------------------------------------------------------
+logging:
+  level: INFO
+  format: json
+  directory: ./logs
+  # Per-service files so a noisy ASR worker cannot bury an API error.
+  per_service_files: true
+  max_bytes: 104857600   # 100 MB
+  backup_count: 10
+  console: true
+  # Never logged, in full or redacted, at any level.
+  redact_keys:
+    - api_key
+    - authorization
+    - grok_api_key
+    - password
+    - token
+    - secret
+
+# --- Monitoring -------------------------------------------------------------
+monitoring:
+  metrics_enabled: true
+  metrics_path: /metrics
+  gpu_metrics_enabled: true
+  gpu_poll_interval_s: 5.0
+  tracing_enabled: false
+  otlp_endpoint: null
+
+# --- Security ---------------------------------------------------------------
+security:
+  # Empty => the auth hook is a no-op. Populate via ORPHUS_API_KEYS to enforce.
+  api_keys: []
+  rate_limit_enabled: true
+  rate_limit_requests: 120
+  rate_limit_window_s: 60
+  max_audio_upload_bytes: 26214400   # 25 MB
+  max_text_length: 4000
+
+# --- Model storage ----------------------------------------------------------
+models:
+  root: ./models
+  # null => resolved as <root>/<component>. deploy.sh downloads into these.
+  asr_path: null
+  tts_path: null
+  vad_path: null
+  download_timeout_s: 1800.0

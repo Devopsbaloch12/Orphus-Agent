@@ -1,0 +1,42 @@
+; ---------------------------------------------------------------------------
+; Orphus -- supervisord master configuration (TEMPLATE)
+;
+; Rendered by deploy.sh into ${RUN_DIR}/supervisord.conf. Every {{PLACEHOLDER}}
+; is substituted at render time; do not edit the rendered copy, edit this file
+; and re-run ./deploy.sh (rendering is idempotent).
+;
+; Process environment: supervisord is started by scripts/start.sh *after* it has
+; exported .env, so every child program inherits GROK_API_KEY, REDIS_URL, etc.
+; from supervisord's own environment. Secrets are therefore never written into
+; this file. The consequence is that changing .env requires restarting
+; supervisord itself, not just the program:  ./scripts/restart.sh --reload-env
+; ---------------------------------------------------------------------------
+
+[unix_http_server]
+file={{SUPERVISOR_SOCK}}
+chmod=0700
+
+[supervisord]
+logfile={{LOG_DIR}}/supervisord.log
+logfile_maxbytes=50MB
+logfile_backups=5
+loglevel=info
+pidfile={{SUPERVISOR_PID}}
+nodaemon=false
+minfds=65536
+minprocs=200
+directory={{ORPHUS_ROOT}}
+; Non-secret defaults handed to every child. Real configuration arrives via the
+; inherited process environment.
+environment=PYTHONUNBUFFERED="1",PYTHONFAULTHANDLER="1",PYTHONDONTWRITEBYTECODE="1"
+
+[rpcinterface:supervisor]
+supervisor.rpcinterface_factory = supervisor.rpcinterface:make_main_rpcinterface
+
+[supervisorctl]
+serverurl=unix://{{SUPERVISOR_SOCK}}
+
+; Program definitions are rendered individually so that optional services
+; (Redis, PostgreSQL) exist only when this host actually manages them.
+[include]
+files = {{SUPERVISOR_INCLUDE_DIR}}/*.conf

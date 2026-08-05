@@ -1,0 +1,33 @@
+; ---------------------------------------------------------------------------
+; Orphus -- co-located Redis (TEMPLATE, OPTIONAL)
+;
+; Rendered only when deploy.sh decides this host must manage Redis itself:
+; REDIS_URL points at localhost AND nothing is already listening there. On a
+; RunPod pod there is no systemd, so supervisor is the only sane process
+; manager available. Point REDIS_URL at a managed Redis and this file is never
+; rendered.
+;
+; Persistence is deliberately OFF (--save "" --appendonly no). Redis holds live
+; session coordination state only; anything that must survive a restart goes to
+; PostgreSQL. Losing Redis drops in-flight calls, which are unrecoverable
+; anyway, and the fsync cost would otherwise land on the realtime audio path.
+; ---------------------------------------------------------------------------
+
+[program:orphus-redis]
+command={{REDIS_SERVER}} --port {{REDIS_PORT}} --bind {{REDIS_BIND}} --dir {{REDIS_DIR}} --save "" --appendonly no --maxmemory {{REDIS_MAXMEMORY}} --maxmemory-policy allkeys-lru --daemonize no
+directory={{RUN_DIR}}
+autostart=true
+autorestart=true
+startsecs=5
+startretries=3
+stopsignal=TERM
+stopwaitsecs=15
+user={{RUN_USER}}
+stdout_logfile={{LOG_DIR}}/redis.out.log
+stderr_logfile={{LOG_DIR}}/redis.err.log
+stdout_logfile_maxbytes=20MB
+stderr_logfile_maxbytes=20MB
+stdout_logfile_backups=3
+stderr_logfile_backups=3
+; Must be up before the API tries to connect.
+priority=10

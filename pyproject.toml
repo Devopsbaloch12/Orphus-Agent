@@ -1,0 +1,178 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "orphus"
+version = "0.1.0"
+description = "Production-grade local voice AI platform: streaming VAD -> ASR -> LLM -> TTS"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+
+# Core runtime dependencies. Deliberately GPU-free so the full test suite and the
+# API layer install and run on any dev machine (including Windows without CUDA).
+# Everything that needs a GPU lives in the `gpu` extra.
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "pyyaml>=6.0",
+    "httpx>=0.27",
+    "numpy>=1.26",
+    "redis[hiredis]>=5.2",
+    "asyncpg>=0.30",
+    "sqlalchemy[asyncio]>=2.0",
+    "alembic>=1.14",
+    "prometheus-client>=0.21",
+    "psutil>=6.1",
+    "websockets>=13.1",
+    "python-multipart>=0.0.17",
+]
+
+[project.optional-dependencies]
+# Installed by deploy.sh on the RunPod target. Never required for unit tests.
+gpu = [
+    "torch>=2.5",
+    "torchaudio>=2.5",
+    "transformers>=5.13.0",
+    "nemo_toolkit[asr]>=2.0",
+    "vllm>=0.7.3",
+    "onnxruntime-gpu>=1.20",
+    "snac>=1.2.1",
+    "orpheus-speech>=0.1.0",
+    "soundfile>=0.12",
+    "librosa>=0.10",
+]
+# Local microphone capture / playback for the desktop client.
+audio = [
+    "sounddevice>=0.5",
+    "soundfile>=0.12",
+]
+observability = [
+    "opentelemetry-api>=1.28",
+    "opentelemetry-sdk>=1.28",
+    "opentelemetry-instrumentation-fastapi>=0.49b0",
+    "nvidia-ml-py>=12.560",
+]
+dev = [
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "pytest-timeout>=2.3",
+    "hypothesis>=6.119",
+    "types-pyyaml>=6.0",
+    "types-psutil>=6.1",
+]
+
+[project.scripts]
+orphus = "orphus.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/orphus"]
+
+# ---------------------------------------------------------------------------
+# Ruff
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",    # pycodestyle
+    "F",         # pyflakes
+    "I",         # isort
+    "N",         # pep8-naming
+    "UP",        # pyupgrade
+    "B",         # flake8-bugbear
+    "A",         # flake8-builtins
+    "C4",        # flake8-comprehensions
+    "DTZ",       # flake8-datetimez -- naive datetimes are a real bug source here
+    "T20",       # flake8-print -- use the logger, never print
+    "SIM",       # flake8-simplify
+    "TID",       # flake8-tidy-imports
+    "RUF",       # ruff-specific
+    "ASYNC",     # flake8-async -- blocking calls in async code
+    "S",         # flake8-bandit -- security
+]
+ignore = [
+    "S101",  # assert is fine in tests
+    "N818",  # public queue exceptions intentionally mirror asyncio names
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "T20"]
+"benchmarks/**" = ["T20"]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "parents"
+
+# ---------------------------------------------------------------------------
+# mypy
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+warn_return_any = true
+disallow_any_generics = true
+show_error_codes = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+# Optional GPU stack ships no usable stubs.
+module = [
+    "nemo.*",
+    "vllm.*",
+    "snac.*",
+    "onnxruntime.*",
+    "sounddevice.*",
+    "soundfile.*",
+    "librosa.*",
+    "pynvml.*",
+    "transformers.*",
+    "silero_vad.*",
+    "orpheus_tts.*",
+    "yaml",
+    "psutil",
+]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["orphus.audio.convert", "orphus.audio.resample"]
+disable_error_code = ["type-arg", "misc", "no-any-return"]
+
+[[tool.mypy.overrides]]
+module = ["orphus.asr.nemotron"]
+disable_error_code = ["type-arg", "unreachable"]
+
+[[tool.mypy.overrides]]
+module = ["orphus.vad.silero"]
+disable_error_code = ["no-untyped-call"]
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+timeout = 120
+# basetemp is pinned into the project because the system temp directory is not
+# reliably writable on locked-down Windows dev machines, which makes every
+# tmp_path-using test fail with a PermissionError that looks like a code bug.
+addopts = "-ra --strict-markers --strict-config"
+markers = [
+    "gpu: requires a CUDA device (deselect with '-m \"not gpu\"')",
+    "integration: requires Redis and PostgreSQL",
+    "slow: long-running stress/load test",
+]
+
+[tool.coverage.run]
+source = ["src/orphus"]
+branch = true

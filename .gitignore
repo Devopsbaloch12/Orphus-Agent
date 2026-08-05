@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# Tooling caches
+.pytest_cache/
+.pytest-tmp/
+.pytest-run*/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Secrets and local config -- never commit
+.env
+.env.*
+!.env.example
+config/local.yaml
+config/*.local.yaml
+
+# Runtime artifacts
+logs/
+run/
+*.log
+
+# Model weights: downloaded by deploy.sh, far too large for git
+models/
+!models/.gitkeep
+
+# Vendored upstream model repos: cloned by deploy.sh for reference
+vendor/
+
+# Audio scratch
+*.wav
+*.mp3
+!tests/fixtures/**/*.wav
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.claude/
+HANDOFF.md

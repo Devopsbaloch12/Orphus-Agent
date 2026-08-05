@@ -1,0 +1,34 @@
+; ---------------------------------------------------------------------------
+; Orphus -- co-located PostgreSQL (TEMPLATE, OPTIONAL)
+;
+; Rendered only when deploy.sh decides this host must manage PostgreSQL itself:
+; DATABASE_URL points at localhost AND nothing is already listening there AND a
+; postgres binary was found. Point DATABASE_URL at a managed instance (RDS,
+; Neon, a sidecar) and this file is never rendered -- which is the recommended
+; production topology, because a pod-local database dies with the pod.
+;
+; Runs as the {{PG_RUN_USER}} account: the server refuses to start as root.
+; ---------------------------------------------------------------------------
+
+[program:orphus-postgres]
+command={{PG_BIN}}/postgres -D {{PGDATA}} -p {{PG_PORT}} -c listen_addresses={{PG_LISTEN}}
+directory={{PGDATA}}
+autostart=true
+autorestart=true
+startsecs=10
+startretries=3
+; Fast Shutdown: disconnect clients, roll back their transactions, checkpoint.
+; SIGQUIT (immediate) would force recovery on the next start.
+stopsignal=INT
+stopwaitsecs=60
+stopasgroup=false
+killasgroup=false
+user={{PG_RUN_USER}}
+stdout_logfile={{LOG_DIR}}/postgres.out.log
+stderr_logfile={{LOG_DIR}}/postgres.err.log
+stdout_logfile_maxbytes=20MB
+stderr_logfile_maxbytes=20MB
+stdout_logfile_backups=3
+stderr_logfile_backups=3
+; Must be up before migrations and before the API opens its pool.
+priority=20

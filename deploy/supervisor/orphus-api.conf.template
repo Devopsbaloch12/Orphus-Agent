@@ -1,0 +1,42 @@
+; ---------------------------------------------------------------------------
+; Orphus API service (TEMPLATE)
+;
+; The single process that holds the models. VAD (CPU/ONNX), Nemotron ASR, the
+; vLLM engine serving Orpheus, and the SNAC decoder all live here, alongside the
+; FastAPI/WebSocket layer and the internal scheduler's worker pool.
+;
+; Why one process: every additional OS worker would load its own copy of the
+; weights and multiply VRAM. config/default.yaml pins server.api_workers to 1
+; for exactly this reason; concurrency comes from the asyncio scheduler
+; (scheduler.worker_count), not from forked workers.
+; ---------------------------------------------------------------------------
+
+[program:orphus-api]
+command={{API_COMMAND}}
+directory={{ORPHUS_ROOT}}
+autostart=true
+autorestart=unexpected
+exitcodes=0
+; Loading a 3B model into vLLM plus the ASR checkpoint takes a while. The
+; process must stay alive this long before supervisor calls the start a success.
+startsecs={{API_STARTSECS}}
+; After this many consecutive failed starts supervisor gives up and marks the
+; program FATAL rather than hot-looping. See docs/runbook.md "worker crash-loop".
+startretries=3
+stopsignal=TERM
+; Must exceed server.shutdown_grace_s so in-flight conversations drain instead
+; of being severed.
+stopwaitsecs={{API_STOPWAIT}}
+; vLLM forks engine workers. Without these, a stop leaves orphaned processes
+; holding VRAM and the next start fails with "out of memory".
+stopasgroup=true
+killasgroup=true
+user={{RUN_USER}}
+stdout_logfile={{LOG_DIR}}/api.out.log
+stderr_logfile={{LOG_DIR}}/api.err.log
+stdout_logfile_maxbytes=100MB
+stderr_logfile_maxbytes=100MB
+stdout_logfile_backups=10
+stderr_logfile_backups=10
+redirect_stderr=false
+priority=100

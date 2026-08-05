@@ -1,0 +1,74 @@
+# ---------------------------------------------------------------------------
+# Orphus API -- systemd unit (TEMPLATE)
+#
+# For bare-metal and VM hosts where systemd is PID 1. RunPod pods are
+# containers with no systemd; there, supervisor is the process manager and
+# deploy.sh uses deploy/supervisor/*.template instead. The two paths are
+# interchangeable -- pick whichever your host actually supports.
+#
+# Install:
+#   sed -e "s|{{ORPHUS_ROOT}}|/opt/orphus|g" \
+#       -e "s|{{VENV_DIR}}|/opt/orphus/.venv|g" \
+#       -e "s|{{RUN_USER}}|orphus|g" \
+#       -e "s|{{RUN_GROUP}}|orphus|g" \
+#       deploy/systemd/orphus.service.template \
+#     | sudo tee /etc/systemd/system/orphus.service >/dev/null
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now orphus
+# ---------------------------------------------------------------------------
+
+[Unit]
+Description=Orphus voice AI platform (API + in-process model workers)
+Documentation=file://{{ORPHUS_ROOT}}/docs/deployment.md
+After=network-online.target redis-server.service postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+User={{RUN_USER}}
+Group={{RUN_GROUP}}
+WorkingDirectory={{ORPHUS_ROOT}}
+
+# Flat variables (HOST, PORT, GROK_API_KEY, REDIS_URL, ...) are only honoured
+# when they are in the *process environment* -- see docs/configuration.md.
+# EnvironmentFile puts them there. The leading '-' tolerates a missing file so
+# the unit still starts on a host configured purely through the environment.
+EnvironmentFile=-{{ORPHUS_ROOT}}/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONFAULTHANDLER=1
+Environment=ORPHUS_ENV=production
+
+ExecStart={{VENV_DIR}}/bin/python -m uvicorn --factory orphus.api.app:create_app \
+    --host ${HOST} --port ${PORT} --workers 1 \
+    --timeout-graceful-shutdown 20
+
+# Loading a 3B TTS model into vLLM plus the ASR checkpoint is slow. Without a
+# generous start timeout systemd kills the process mid-load and never recovers.
+TimeoutStartSec=600
+# Must exceed server.shutdown_grace_s so live conversations drain.
+TimeoutStopSec=45
+KillSignal=SIGTERM
+# vLLM forks engine workers; kill the whole cgroup or they keep holding VRAM.
+KillMode=control-group
+
+Restart=on-failure
+RestartSec=10
+# Give up rather than crash-loop: 5 restarts inside 10 minutes -> failed state.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+# GPU access requires the nvidia device nodes; do not enable PrivateDevices.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths={{ORPHUS_ROOT}}/logs {{ORPHUS_ROOT}}/run {{ORPHUS_ROOT}}/models
+
+# Model loading and 20 concurrent audio streams both need generous limits.
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+
+StandardOutput=append:{{ORPHUS_ROOT}}/logs/api.out.log
+StandardError=append:{{ORPHUS_ROOT}}/logs/api.err.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,56 @@
+# ---------------------------------------------------------------------------
+# Orphus -- supervisord under systemd (TEMPLATE)
+#
+# Use this instead of orphus.service when you want the *same* supervisor
+# topology on a systemd host as on RunPod: one supervisord owning orphus-api
+# (plus optionally orphus-redis / orphus-postgres). Systemd then supervises the
+# supervisor, so a host reboot brings everything back.
+#
+# Do NOT enable this and orphus.service at the same time; they would both try
+# to bind PORT.
+#
+# Install:
+#   sed -e "s|{{ORPHUS_ROOT}}|/opt/orphus|g" \
+#       -e "s|{{VENV_DIR}}|/opt/orphus/.venv|g" \
+#       -e "s|{{RUN_DIR}}|/opt/orphus/run|g" \
+#       -e "s|{{RUN_USER}}|root|g" \
+#       deploy/systemd/orphus-supervisor.service.template \
+#     | sudo tee /etc/systemd/system/orphus-supervisor.service >/dev/null
+#   sudo systemctl daemon-reload && sudo systemctl enable --now orphus-supervisor
+# ---------------------------------------------------------------------------
+
+[Unit]
+Description=Orphus process supervisor (supervisord)
+Documentation=file://{{ORPHUS_ROOT}}/docs/deployment.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User={{RUN_USER}}
+WorkingDirectory={{ORPHUS_ROOT}}
+
+# supervisord's own environment is what every managed program inherits, which
+# is how flat variables such as GROK_API_KEY reach the API process.
+EnvironmentFile=-{{ORPHUS_ROOT}}/.env
+Environment=PYTHONUNBUFFERED=1
+
+# -n keeps supervisord in the foreground so systemd tracks the real PID.
+ExecStart={{VENV_DIR}}/bin/supervisord -n -c {{RUN_DIR}}/supervisord.conf
+ExecReload={{VENV_DIR}}/bin/supervisorctl -c {{RUN_DIR}}/supervisord.conf reload
+
+# Long enough for the API child to finish loading models before systemd gives up
+# on a restart cycle.
+TimeoutStartSec=60
+TimeoutStopSec=120
+KillMode=mixed
+KillSignal=SIGTERM
+
+Restart=on-failure
+RestartSec=10
+
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target

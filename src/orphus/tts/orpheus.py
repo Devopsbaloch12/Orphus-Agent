@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -11,11 +12,30 @@ from orphus.config.settings import TTSSettings
 from orphus.domain.types import TTS_SAMPLE_RATE, AudioChunk, SessionId, TextDelta
 
 
-def _next_chunk(iterator: Any) -> tuple[bool, bytes]:
-    try:
-        return True, next(iterator)
-    except StopIteration:
-        return False, b""
+async def _decode_tokens(token_gen: AsyncIterator[str]) -> AsyncIterator[bytes]:
+    """SNAC-decode a token stream into PCM, off the event loop.
+
+    Mirrors ``orpheus_tts.decoder.tokens_decoder`` -- same 7-token cadence and
+    28-token sliding window -- except that ``convert_to_audio`` is a synchronous
+    CUDA decode, and upstream awaits it inline. On one call that is merely a
+    stall; with twenty concurrent sessions it blocks the loop that every other
+    session's audio, sockets and VAD depend on, so the decode is handed to a
+    worker thread instead.
+    """
+    from orpheus_tts.decoder import convert_to_audio, turn_token_into_id
+
+    buffer: list[int] = []
+    count = 0
+    async for token_sim in token_gen:
+        token = turn_token_into_id(token_sim, count)
+        if token is None or token <= 0:
+            continue
+        buffer.append(token)
+        count += 1
+        if count % 7 == 0 and count > 27:
+            audio = await asyncio.to_thread(convert_to_audio, buffer[-28:], count)
+            if audio is not None:
+                yield audio
 
 
 class _OrpheusSession:
@@ -107,20 +127,50 @@ class OrpheusTTS:
         session_id: SessionId,
         cancelled: asyncio.Event,
     ) -> AsyncIterator[AudioChunk]:
-        iterator = self._model.generate_speech(
-            prompt=text,
-            voice=voice,
-            request_id=str(session_id),
+        """Stream synthesis for one text chunk, driven on the server's loop.
+
+        Deliberately *not* ``OrpheusModel.generate_speech``. That helper runs
+        each synthesis in its own thread under ``asyncio.run()``, and vLLM's
+        ``AsyncLLM`` binds its single output-handler task to whichever loop
+        first issues a request. The first synthesis therefore adopted a
+        throwaway loop, and when ``asyncio.run()`` tore that loop down the
+        handler was cancelled -- after which *every* later request failed with
+        ``EngineDeadError`` even though the engine process was healthy. One
+        call worked, the rest heard silence.
+
+        Driving ``engine.generate`` directly keeps the handler on uvicorn's
+        long-lived loop and lets vLLM batch all concurrent sessions natively,
+        which is what it exists to do.
+        """
+        from vllm import SamplingParams
+
+        model = self._model
+        sampling_params = SamplingParams(
             temperature=self._settings.temperature,
             top_p=self._settings.top_p,
-            repetition_penalty=self._settings.repetition_penalty,
-            stop_token_ids=[128258],
             max_tokens=self._settings.max_model_len,
+            stop_token_ids=[128258],
+            repetition_penalty=self._settings.repetition_penalty,
         )
+        # Unique per synthesis: a session emits one of these per sentence chunk,
+        # and vLLM requires request ids to be globally unique.
+        request_id = f"{session_id}-{uuid.uuid4().hex}"
+
+        async def token_gen() -> AsyncIterator[str]:
+            async for result in model.engine.generate(
+                prompt=model._format_prompt(text, voice),
+                sampling_params=sampling_params,
+                request_id=request_id,
+            ):
+                if cancelled.is_set():
+                    await model.engine.abort(request_id)
+                    return
+                yield result.outputs[0].text
+
         sequence = 0
-        while not cancelled.is_set():
-            found, raw = await asyncio.to_thread(_next_chunk, iterator)
-            if not found:
+        async for raw in _decode_tokens(token_gen()):
+            if cancelled.is_set():
+                await model.engine.abort(request_id)
                 return
             yield AudioChunk(pcm16_to_float32(raw), TTS_SAMPLE_RATE, sequence=sequence)
             sequence += 1

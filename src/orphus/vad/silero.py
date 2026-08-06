@@ -82,7 +82,26 @@ class SileroVAD:
 
     def open_session(self, session_id: SessionId) -> _SileroSession:
         del session_id
-        return _SileroSession(copy.deepcopy(self._model), self._settings)
+        return _SileroSession(self._clone_model(), self._settings)
+
+    def _clone_model(self) -> Any:
+        """Per-call model with independent recurrent state.
+
+        The ONNX build wraps an ``onnxruntime.InferenceSession``, which cannot
+        be pickled and therefore cannot be deep-copied -- and does not need to
+        be: ORT sessions are safe for concurrent ``run()`` calls. Only the
+        recurrent state (``_state``/``_context``) may not be shared between
+        calls, so shallow-copy the wrapper and reset the clone's state, which
+        rebinds those tensors on the clone alone.
+        """
+        try:
+            return copy.deepcopy(self._model)
+        except TypeError:
+            clone = copy.copy(self._model)
+            reset = getattr(clone, "reset_states", None)
+            if reset is not None:
+                reset()
+            return clone
 
     async def aclose(self) -> None:
         self._model = None

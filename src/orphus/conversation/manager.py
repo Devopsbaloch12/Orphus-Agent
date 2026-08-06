@@ -10,8 +10,24 @@ from orphus.conversation.errors import SessionLimitError, SessionNotFoundError
 from orphus.conversation.history import History
 from orphus.conversation.session import Session
 from orphus.domain.types import SessionId
+from orphus.observability.logging import get_logger
 
 __all__ = ["SessionManager"]
+
+logger = get_logger(__name__)
+
+
+def _log_close_failures(sessions: list[Session], results: list[Any]) -> None:
+    # A session that fails to close cleanly leaks its VAD/ASR/TTS state and
+    # its slot against session.max_concurrent -- invisible until the ceiling
+    # is hit and unrelated *new* calls start getting rejected. That ripple
+    # effect is why this needs to be logged at the source, not just here.
+    for session, result in zip(sessions, results, strict=True):
+        if isinstance(result, Exception):
+            logger.exception(
+                f"session_manager.close_failed session={session.session_id}",
+                exc_info=result,
+            )
 
 
 class SessionManager:
@@ -87,10 +103,11 @@ class SessionManager:
             ]
             for session in expired:
                 self._sessions.pop(session.session_id, None)
-        await asyncio.gather(
+        results = await asyncio.gather(
             *(session.aclose(reason="timeout") for session in expired),
             return_exceptions=True,
         )
+        _log_close_failures(expired, results)
         return len(expired)
 
     async def aclose(self) -> None:
@@ -98,8 +115,9 @@ class SessionManager:
             self._closed = True
             sessions = list(self._sessions.values())
             self._sessions.clear()
-        await asyncio.gather(
+        results = await asyncio.gather(
             *(session.aclose(reason="shutdown") for session in sessions),
             return_exceptions=True,
         )
+        _log_close_failures(sessions, results)
 

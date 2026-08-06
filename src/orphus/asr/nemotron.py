@@ -12,6 +12,9 @@ import numpy as np
 
 from orphus.config.settings import ASRSettings
 from orphus.domain.types import AudioChunk, SessionId, TranscriptEvent
+from orphus.observability.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class _NemotronSession:
@@ -40,6 +43,12 @@ class _NemotronSession:
             return None
         audio = np.concatenate(self._chunks).astype(np.float32, copy=False)
         self._chunks.clear()
+        peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+        rms = float(np.sqrt(np.mean(audio**2))) if audio.size else 0.0
+        logger.info(
+            f"asr.flush_audio duration_s={audio.size / 16_000:.3f} "
+            f"peak={peak:.4f} rms={rms:.4f}"
+        )
         text = await self._owner.transcribe(audio, self._language)
         return TranscriptEvent(text=text, is_final=True, timestamp_s=time.monotonic())
 
@@ -103,7 +112,15 @@ class NemotronASR:
         inputs = self._processor(audio, sampling_rate=16_000, language=language)
         inputs = inputs.to(model.device, dtype=model.dtype)
         with torch.inference_mode():
-            output = model.generate(**inputs, return_dict_in_generate=True)
+            # Without an explicit cap, HF's "model-agnostic default max_length"
+            # scales with *audio input* length, not expected transcript
+            # length -- observed swinging 230 to 3270 across calls in this
+            # session. For an RNNT decoder that inflates the search space far
+            # past what a conversational utterance needs. 256 is generous for
+            # VAD-bounded utterances (min_silence_ms ends turns promptly).
+            output = model.generate(
+                **inputs, return_dict_in_generate=True, max_new_tokens=256
+            )
         # decode() returns a list of strings, one per batch row. str() on that
         # yields "['hello there']" -- the brackets and quotes were reaching the
         # LLM as if the caller had spoken them.

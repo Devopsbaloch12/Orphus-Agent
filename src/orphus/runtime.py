@@ -11,8 +11,11 @@ from orphus.config import Settings
 from orphus.conversation.session import Session
 from orphus.database import TurnRepository
 from orphus.providers import GrokProvider
+from orphus.observability.logging import get_logger
 from orphus.streaming import VoicePipeline
 from orphus.tts import OrpheusTTS
+
+logger = get_logger(__name__)
 from orphus.vad import SileroVAD
 
 
@@ -105,4 +108,12 @@ class ModelRuntime:
             )
             if item
         ]
-        await asyncio.gather(*(item.aclose() for item in components), return_exceptions=True)
+        results = await asyncio.gather(
+            *(item.aclose() for item in components), return_exceptions=True
+        )
+        for component, result in zip(components, results, strict=True):
+            if isinstance(result, Exception):
+                logger.exception(
+                    f"runtime.component_close_failed component={type(component).__name__}",
+                    exc_info=result,
+                )

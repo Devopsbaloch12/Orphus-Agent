@@ -87,9 +87,14 @@ async def run_call(call_id: int, pcm: bytes, out_path: str | None, voice: str):
         speech_ends_at = t0 + len(pcm) / (IN_RATE * 2)
         try:
             while True:
-                # Wait longer for the first frame (ASR + LLM + TTS cold path),
-                # then only long enough to notice the reply has finished.
-                timeout = 5 if first_audio_at is not None else 90
+                # Wait longer for the first frame (ASR + LLM + TTS cold path).
+                # After that, still generous: multi-sentence replies synthesize
+                # per-sentence, and under concurrent GPU load the gap between
+                # sentences can legitimately exceed a few seconds -- too tight
+                # a timeout here reads as "reply finished" mid-sentence and
+                # truncates every longer reply, corrupting latency/length
+                # numbers for the whole load test.
+                timeout = 15 if first_audio_at is not None else 90
                 frame = await asyncio.wait_for(ws.recv(), timeout=timeout)
                 if isinstance(frame, bytes):
                     now = time.monotonic()

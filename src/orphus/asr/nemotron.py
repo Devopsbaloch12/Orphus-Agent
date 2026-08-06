@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import time
 from collections.abc import AsyncIterator
 from typing import Any
@@ -74,6 +75,23 @@ class NemotronASR:
         del session_id
         return _NemotronSession(self, language or self._settings.language)
 
+    def _view(self) -> Any:
+        """A per-transcription view of the shared model.
+
+        ``generate()`` on the Nemotron RNNT stack keeps its working state on the
+        module instance (``get_audio_features``, ``_step_durations``,
+        ``_symbols_at_frame``, ...) and deletes it when the call unwinds. That is
+        fine for one caller and fatal for a voice platform: several sessions
+        transcribe at once, one call's cleanup pulls the attributes out from
+        under another, and the loser dies with ``AttributeError`` -- the caller
+        simply never hears a reply.
+
+        A shallow copy gives each transcription its own ``__dict__`` while the
+        parameter, buffer and submodule dicts stay shared by reference, so this
+        costs no VRAM and loads no second copy of the weights.
+        """
+        return copy.copy(self._model)
+
     async def transcribe(self, audio: np.ndarray, language: str) -> str:
         async with self._gate:
             return await asyncio.to_thread(self._transcribe_sync, audio, language)
@@ -81,10 +99,11 @@ class NemotronASR:
     def _transcribe_sync(self, audio: np.ndarray, language: str) -> str:
         import torch
 
+        model = self._view()
         inputs = self._processor(audio, sampling_rate=16_000, language=language)
-        inputs = inputs.to(self._model.device, dtype=self._model.dtype)
+        inputs = inputs.to(model.device, dtype=model.dtype)
         with torch.inference_mode():
-            output = self._model.generate(**inputs, return_dict_in_generate=True)
+            output = model.generate(**inputs, return_dict_in_generate=True)
         return str(self._processor.decode(output.sequences, skip_special_tokens=True)).strip()
 
     async def aclose(self) -> None:

@@ -28,7 +28,11 @@ minprocs=200
 directory={{ORPHUS_ROOT}}
 ; Non-secret defaults handed to every child. Real configuration arrives via the
 ; inherited process environment.
-environment=PYTHONUNBUFFERED="1",PYTHONFAULTHANDLER="1",PYTHONDONTWRITEBYTECODE="1"
+; PYTHONDONTWRITEBYTECODE is deliberately NOT set: with the venv on a network
+; volume, recompiling every dependency from source on each start dominates
+; startup. The API program redirects __pycache__ to local disk instead, so the
+; volume stays clean and restarts reuse the compiled bytecode.
+environment=PYTHONUNBUFFERED="1",PYTHONFAULTHANDLER="1"
 
 [rpcinterface:supervisor]
 supervisor.rpcinterface_factory = supervisor.rpcinterface:make_main_rpcinterface

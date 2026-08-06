@@ -36,7 +36,11 @@ user={{RUN_USER}}
 ; kernels. The CUDA 13 libraries ship inside the venv (nvidia/cu13/lib) but are
 ; not on the default loader path, so without this the engine core aborts with
 ; ImportError: libnvrtc.so.13: cannot open shared object file.
-environment=LD_LIBRARY_PATH="{{VENV_DIR}}/lib/python3.12/site-packages/nvidia/cu13/lib:{{VENV_DIR}}/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib:%(ENV_LD_LIBRARY_PATH)s"
+; PYTHONPYCACHEPREFIX puts __pycache__ on the container's local disk. The venv
+; usually lives on a RunPod network volume, where recompiling several hundred
+; packages from source on every start costs minutes; caching the bytecode
+; locally makes restarts substantially faster without writing into the volume.
+environment=LD_LIBRARY_PATH="{{VENV_DIR}}/lib/python3.12/site-packages/nvidia/cu13/lib:{{VENV_DIR}}/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib:%(ENV_LD_LIBRARY_PATH)s",PYTHONPYCACHEPREFIX="{{PYCACHE_DIR}}"
 stdout_logfile={{LOG_DIR}}/api.out.log
 stderr_logfile={{LOG_DIR}}/api.err.log
 stdout_logfile_maxbytes=100MB

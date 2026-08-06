@@ -1266,6 +1266,7 @@ step_supervisor_config() {
                        "LOG_DIR=${LOG_DIR}" \
                        "RUN_USER=${RUN_USER}" \
                        "VENV_DIR=${VENV_DIR}" \
+                       "PYCACHE_DIR=${ORPHUS_PYCACHE_DIR:-/var/lib/orphus-pycache}" \
                        "API_STARTSECS=${ORPHUS_API_STARTSECS:-30}" \
                        "API_STOPWAIT=${ORPHUS_API_STOPWAIT:-45}"; then
         SUPERVISOR_DIRTY=1

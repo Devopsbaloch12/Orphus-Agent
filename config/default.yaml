@@ -41,7 +41,7 @@ vad:
   min_speech_ms: 250
   # Silence this long ends the utterance. 700ms is the usual conversational
   # sweet spot: shorter clips people mid-thought, longer feels laggy.
-  min_silence_ms: 700
+  min_silence_ms: 416
   # Audio retained before SPEECH_STARTED so the ASR sees the whole first word.
   speech_pad_ms: 120
 

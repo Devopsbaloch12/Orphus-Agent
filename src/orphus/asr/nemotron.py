@@ -104,7 +104,13 @@ class NemotronASR:
         inputs = inputs.to(model.device, dtype=model.dtype)
         with torch.inference_mode():
             output = model.generate(**inputs, return_dict_in_generate=True)
-        return str(self._processor.decode(output.sequences, skip_special_tokens=True)).strip()
+        # decode() returns a list of strings, one per batch row. str() on that
+        # yields "['hello there']" -- the brackets and quotes were reaching the
+        # LLM as if the caller had spoken them.
+        decoded = self._processor.decode(output.sequences, skip_special_tokens=True)
+        if isinstance(decoded, (list, tuple)):
+            decoded = decoded[0] if decoded else ""
+        return str(decoded).strip()
 
     async def aclose(self) -> None:
         self._model = None

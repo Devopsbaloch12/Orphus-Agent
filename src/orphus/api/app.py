@@ -27,9 +27,13 @@ from orphus.conversation.manager import SessionManager
 from orphus.domain.types import AudioEncoding
 from orphus.middleware import ApiKeyAuthenticator, RateLimiter, RequestContextMiddleware
 from orphus.observability.health import HealthRegistry, check_disk, check_memory
+from orphus.observability.logging import get_logger
 from orphus.observability.metrics import CONTENT_TYPE_LATEST, get_metrics
 from orphus.runtime import ModelRuntime
 from orphus.streaming import VoicePipeline
+
+
+logger = get_logger(__name__)
 
 
 class CreateSessionRequest(BaseModel):
@@ -70,15 +74,40 @@ def create_app(
             )
         )
 
+    async def _reaper() -> None:
+        """Expire idle and over-long sessions.
+
+        SessionManager.reap() is the only thing that frees a seat when a caller
+        vanishes without a DELETE -- a dropped carrier leg, a crashed client, a
+        socket that just goes away. Nothing drove it, so sessions accumulated
+        for the life of the process: after max_concurrent calls every new
+        session got 503 forever, with the fix a restart away. Sweep on a
+        fraction of the idle timeout so a freed seat is reusable promptly.
+        """
+        interval = max(5.0, min(config.session.idle_timeout_s / 4, 60.0))
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                reaped = await manager.reap()
+                if reaped:
+                    logger.info("session.reaped", extra={"count": reaped})
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # a sweep failure must not kill the sweeper
+                logger.exception("session.reap_failed")
+
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         nonlocal pipeline_factory
         if runtime is not None and config.environment == "production":
             await runtime.load()
             pipeline_factory = runtime.pipeline
+        reaper = asyncio.create_task(_reaper())
         try:
             yield
         finally:
+            reaper.cancel()
+            await asyncio.gather(reaper, return_exceptions=True)
             await manager.aclose()
             if runtime is not None:
                 await runtime.aclose()

@@ -32,6 +32,11 @@ stopwaitsecs={{API_STOPWAIT}}
 stopasgroup=true
 killasgroup=true
 user={{RUN_USER}}
+; vLLM/flashinfer dlopen the CUDA runtime compiler when they JIT their attention
+; kernels. The CUDA 13 libraries ship inside the venv (nvidia/cu13/lib) but are
+; not on the default loader path, so without this the engine core aborts with
+; ImportError: libnvrtc.so.13: cannot open shared object file.
+environment=LD_LIBRARY_PATH="{{VENV_DIR}}/lib/python3.12/site-packages/nvidia/cu13/lib:{{VENV_DIR}}/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib:%(ENV_LD_LIBRARY_PATH)s"
 stdout_logfile={{LOG_DIR}}/api.out.log
 stderr_logfile={{LOG_DIR}}/api.err.log
 stdout_logfile_maxbytes=100MB

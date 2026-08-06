@@ -299,8 +299,11 @@ step_os_packages() {
     fi
 
     # libsndfile1 -> soundfile;  ffmpeg -> librosa/audio decode;
-    # build-essential + pkg-config -> source builds when a wheel is missing.
-    local want=(libsndfile1 ffmpeg build-essential pkg-config git curl ca-certificates procps)
+    # build-essential + pkg-config -> source builds when a wheel is missing;
+    # ninja-build -> vLLM/flashinfer JIT-compile attention kernels on first
+    # start. Without it the engine loads the weights, then dies with
+    # FileNotFoundError: 'ninja' and takes the whole API down with it.
+    local want=(libsndfile1 ffmpeg build-essential pkg-config git curl ca-certificates procps ninja-build)
     # Only pull in a server if this host is going to run one itself.
     [[ "$(manage_redis_decision)"    == "yes" ]] && want+=(redis-server redis-tools)
     [[ "$(manage_postgres_decision)" == "yes" ]] && want+=(postgresql postgresql-client)
@@ -413,8 +416,11 @@ step_dependencies() {
 
     # Deploy-time tooling. Deliberately not in pyproject.toml: supervisor and
     # the HF CLI are properties of *this* deployment, not of the package.
-    log_info "installing deploy tooling (supervisor, huggingface_hub CLI)"
-    "${pip}" install --quiet "supervisor>=4.2" "huggingface_hub[cli,hf_transfer]>=0.26"
+    log_info "installing deploy tooling (supervisor, huggingface_hub CLI, silero-vad)"
+    # silero-vad is imported by orphus.vad.silero at model-load time but is not
+    # pulled in by any extra in pyproject.toml; without it the API dies at
+    # startup with ModuleNotFoundError: No module named 'silero_vad'.
+    "${pip}" install --quiet "supervisor>=4.2" "huggingface_hub[cli,hf_transfer]>=0.26" "silero-vad"
 
     # The base install is GPU-free by design, so a dev machine has no ONNX
     # runtime at all and Silero VAD cannot load. Add the CPU build there.
@@ -447,6 +453,126 @@ check_dependency_conflicts() {
 # ---------------------------------------------------------------------------
 # 7. Verify PyTorch sees CUDA
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 6b. Third-party patch: orpheus_tts.OrpheusModel
+#
+# The published orpheus-speech wheel predates the API this codebase targets --
+# its __init__ takes only (model_name, dtype), so orphus.tts.orpheus.load()
+# raises TypeError: unexpected keyword argument 'tokenizer' and the API can
+# never start. Widen the signature in place: accept `tokenizer` and pass any
+# further kwargs (max_model_len, gpu_memory_utilization) through to
+# AsyncEngineArgs. Idempotent -- re-running is a no-op once patched.
+# ---------------------------------------------------------------------------
+step_patch_orpheus() {
+    log_step "Third-party patches"
+    local target
+    target="$("${VENV_DIR}/bin/python" - <<'PY' 2>/dev/null || true
+try:
+    import orpheus_tts.engine_class as m
+    print(m.__file__)
+except Exception:
+    pass
+PY
+)"
+    if [[ -z "${target}" || ! -f "${target}" ]]; then
+        log_warn "orpheus_tts not importable; skipping patch"
+        return 0
+    fi
+    if grep -q "engine_kwargs" "${target}"; then
+        log_ok "orpheus_tts already patched"
+        return 0
+    fi
+    cp -f "${target}" "${target}.orig"
+    "${VENV_DIR}/bin/python" - "${target}" <<'PY'
+import re, sys
+path = sys.argv[1]
+src = open(path).read()
+src = src.replace(
+    "def __init__(self, model_name, dtype=torch.bfloat16):",
+    "def __init__(self, model_name, dtype=torch.bfloat16, tokenizer=None, **engine_kwargs):",
+    1,
+)
+src = src.replace(
+    "self.dtype = dtype\n        self.engine = self._setup_engine()",
+    "self.dtype = dtype\n        self.engine_kwargs = engine_kwargs\n        self.engine = self._setup_engine()",
+    1,
+)
+src = src.replace(
+    "self.tokeniser = AutoTokenizer.from_pretrained(model_name)",
+    "self.tokeniser = AutoTokenizer.from_pretrained(tokenizer or model_name)",
+    1,
+)
+src = re.sub(
+    r"(engine_args = AsyncEngineArgs\(\s*\n\s*model=self\.model_name,\s*\n\s*dtype=self\.dtype,\s*\n)(\s*\))",
+    r"\1            **self.engine_kwargs,\n\2",
+    src,
+    count=1,
+)
+open(path, "w").write(src)
+PY
+    if grep -q "engine_kwargs" "${target}"; then
+        log_ok "patched $(basename "${target}") (original kept as .orig)"
+    else
+        cp -f "${target}.orig" "${target}"
+        die "failed to patch orpheus_tts; restored the original. Upstream layout may have changed."
+    fi
+
+    patch_nemotron_generate
+}
+
+# transformers' Nemotron3_5AsrGenerationMixin.generate() stashes state on the
+# shared model instance and deletes it in a finally block. One model serves
+# every session here, so concurrent transcriptions race: thread A's cleanup
+# makes thread B fail with
+#   AttributeError: 'Nemotron3_5AsrForRNNT' object has no attribute 'get_audio_features'
+# and the caller gets silence. The stashing exists only to inject prompt_ids,
+# which this pipeline never sends, so take a fast path when there is no prompt.
+patch_nemotron_generate() {
+    local gen
+    gen="$("${VENV_DIR}/bin/python" - <<'PY' 2>/dev/null || true
+try:
+    import transformers.models.nemotron3_5_asr.generation_nemotron3_5_asr as m
+    print(m.__file__)
+except Exception:
+    pass
+PY
+)"
+    if [[ -z "${gen}" || ! -f "${gen}" ]]; then
+        log_warn "nemotron3_5_asr generation module not found; skipping patch"
+        return 0
+    fi
+    if grep -q "Fast path, and the only thread-safe one" "${gen}"; then
+        log_ok "nemotron ASR generate already patched"
+        return 0
+    fi
+    cp -f "${gen}" "${gen}.orig"
+    "${VENV_DIR}/bin/python" - "${gen}" <<'PY'
+import sys
+path = sys.argv[1]
+src = open(path).read()
+old = """        self._prompt_ids = kwargs.pop("prompt_ids", None)
+        get_audio_features = self.get_audio_features"""
+new = """        self._prompt_ids = kwargs.pop("prompt_ids", None)
+        if self._prompt_ids is None:
+            # Fast path, and the only thread-safe one. The wrapper below exists
+            # solely to inject prompt_ids into get_audio_features; with no
+            # prompt it is a no-op, while its instance-attribute juggling is a
+            # data race across concurrent sessions on this shared model.
+            del self._prompt_ids
+            return super().generate(inputs=inputs, generation_config=generation_config, **kwargs)
+        get_audio_features = self.get_audio_features"""
+if old not in src:
+    sys.exit("anchor not found")
+open(path, "w").write(src.replace(old, new, 1))
+PY
+    if grep -q "Fast path, and the only thread-safe one" "${gen}"; then
+        log_ok "patched $(basename "${gen}") (original kept as .orig)"
+    else
+        cp -f "${gen}.orig" "${gen}"
+        die "failed to patch nemotron generate; restored the original."
+    fi
+}
+
 step_verify_torch() {
     log_step "PyTorch / CUDA verification"
     if [[ "${SKIP_DEPS}" -eq 1 && ! -x "${VENV_DIR}/bin/python" ]]; then
@@ -607,6 +733,25 @@ step_models() {
     #     needs it cached locally. Tokenizer files only, a few MB.
     download_hf_repo "${tok_repo}" "${MODEL_ROOT}/tts-tokenizer" "TTS tokenizer" \
         --include "tokenizer*" "special_tokens_map.json" "*.txt" "config.json"
+
+    # Postcondition. huggingface_hub 1.x consumes only the first --include
+    # pattern, so the download above can silently land config.json and
+    # special_tokens_map.json without tokenizer.json -- and the API then dies
+    # at startup with "Couldn't instantiate the backend tokenizer". The
+    # finetune-prod TTS repo carries identical tokenizer files, so fall back
+    # to those rather than failing the deploy.
+    if [[ ! -s "${MODEL_ROOT}/tts-tokenizer/tokenizer.json" ]]; then
+        log_warn "TTS tokenizer: tokenizer.json missing; copying from ${MODEL_ROOT}/tts"
+        local f copied=0
+        for f in tokenizer.json tokenizer_config.json special_tokens_map.json; do
+            if [[ -s "${MODEL_ROOT}/tts/${f}" ]]; then
+                cp -f "${MODEL_ROOT}/tts/${f}" "${MODEL_ROOT}/tts-tokenizer/${f}" && copied=$((copied + 1))
+            fi
+        done
+        [[ -s "${MODEL_ROOT}/tts-tokenizer/tokenizer.json" ]] \
+            || die "TTS tokenizer incomplete and ${MODEL_ROOT}/tts has no tokenizer.json to copy."
+        log_ok "TTS tokenizer: repaired (${copied} file(s) copied)"
+    fi
 
     log_info "model root layout:"
     du -sh "${MODEL_ROOT}"/* 2>/dev/null | sed 's/^/         /' || true
@@ -953,7 +1098,10 @@ start_local_postgres() {
     local port="$1"
     local pgbin pgdata pguser
     pgbin="$(find_pg_bin)" || die "DATABASE_URL points at localhost but no postgres binary was found. Install it (${SUDO:+sudo }apt-get install -y postgresql) or point DATABASE_URL at a managed instance."
-    pgdata="${PGDATA:-${RUN_DIR}/pgdata}"
+    # NOT under RUN_DIR by default: on RunPod the repo (and therefore RUN_DIR)
+    # lives on a MooseFS network volume where chown fails with EPERM and initdb
+    # cannot read its own cluster. PGDATA must be on the local container disk.
+    pgdata="${PGDATA:-${ORPHUS_PGDATA:-/var/lib/orphus-pgdata}}"
     pguser="${ORPHUS_PG_RUN_USER:-postgres}"
 
     id -u "${pguser}" >/dev/null 2>&1 \
@@ -1006,8 +1154,13 @@ ensure_pg_role_and_db() {
     if ! ${SUDO} su -s /bin/bash "${pguser}" -c \
         "psql -tAc \"SELECT 1 FROM pg_roles WHERE rolname='${user}'\"" | grep -q 1; then
         log_info "creating role ${user}"
+        # psql applies :'var' interpolation only to script/stdin input, never to
+        # -c, which is sent verbatim -- the old -c form failed with
+        # "syntax error at or near :". Feed the statement on stdin so the
+        # interpolation (and its quoting, which is what makes a password
+        # containing a quote safe) actually runs.
         ORPHUS_PG_PASS="${pass}" ${SUDO} su -s /bin/bash "${pguser}" -c \
-            "psql -v ON_ERROR_STOP=1 --set=pw=\"\${ORPHUS_PG_PASS}\" -c \"CREATE ROLE ${user} LOGIN PASSWORD :'pw';\"" \
+            "psql -v ON_ERROR_STOP=1 --set=pw=\"\${ORPHUS_PG_PASS}\" <<<\"CREATE ROLE ${user} LOGIN PASSWORD :'pw';\"" \
             || die "failed to create role ${user}"
     else
         log_ok "role ${user} exists"
@@ -1112,6 +1265,7 @@ step_supervisor_config() {
                        "ORPHUS_ROOT=${ORPHUS_ROOT}" \
                        "LOG_DIR=${LOG_DIR}" \
                        "RUN_USER=${RUN_USER}" \
+                       "VENV_DIR=${VENV_DIR}" \
                        "API_STARTSECS=${ORPHUS_API_STARTSECS:-30}" \
                        "API_STOPWAIT=${ORPHUS_API_STOPWAIT:-45}"; then
         SUPERVISOR_DIRTY=1
@@ -1294,6 +1448,7 @@ main() {
     step_os_packages        # 4.
     step_venv               # 5.
     step_dependencies       # 6.
+    step_patch_orpheus      #    upstream wheel predates the API we call
     step_verify_torch       # 7.
     step_models             # 8.
     step_vendor             #    optional reference clones
